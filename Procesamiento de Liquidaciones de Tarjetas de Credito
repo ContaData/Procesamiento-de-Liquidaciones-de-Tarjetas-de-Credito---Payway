@@ -1,0 +1,186 @@
+# 📦 Librerías necesarias
+import pandas as pd
+import pymupdf                             # Manejo y lectura de PDFs
+import re                                  # Expresiones regulares
+import os                                  # Navegación por carpetas
+from PIL import Image                      # Manipulación de imágenes
+import io                                  # Manejo de datos en memoria
+from paddleocr import PaddleOCR            # OCR para texto en imágenes
+import numpy as np                         # Manejo de arrays para imágenes
+
+# ✂️ Definición de áreas de recorte sobre el PDF
+area_tarjeta = {"Parte": 1, "x1": 11.520, "x2": 309.168, "y1": 4.948, "y2": 280.520, "width": 297.648, "height": 275.572}
+area_empresa = {"Parte": 2, "x1": 313.736, "x2": 603.772, "y1": 1.141, "y2": 332.280, "width": 290.036, "height": 331.143}
+
+# Se convierten en objetos Rect para usar como clip
+area_part1 = pymupdf.Rect(area_tarjeta["x1"], area_tarjeta["y1"], area_tarjeta["x2"], area_tarjeta["y2"])
+area_part2 = pymupdf.Rect(area_empresa["x1"], area_empresa["y1"], area_empresa["x2"], area_empresa["y2"])
+
+# 🧠 Inicialización del motor OCR en español
+ocr = PaddleOCR(use_angle_cls=True, lang='es')
+
+# 📷 Extraer texto de imágenes embebidas en la primera página del PDF
+def fx_Text_Img(doc):
+    textos_img = []
+    pagina = doc[0]  # Se toma la primera página
+    for img in pagina.get_images():             # Iterar por las imágenes embebidas
+        xref = img[0]
+        base_image = doc.extract_image(xref)
+        image_bytes = base_image["image"]
+        imagen = Image.open(io.BytesIO(image_bytes)).convert("L")  # Convertir a escala de grises
+        imagen_np = np.array(imagen)       # Convertir imagen a array para OCR
+        resultados = ocr.ocr(imagen_np, cls=True)   # Aplicar OCR
+        for linea in resultados[0]:
+            texto = linea[1][0]             # Extraer el texto de cada línea
+            if not "cerca" in texto.lower() and not "comercios" in texto.lower():
+                textos_img.append(texto)    # Filtrar textos irrelevantes
+    return textos_img
+
+# 🏢 Extraer datos de empresa desde región específica del PDF
+def fx_datos_empresa(doc):
+    text_empresa = doc[0].get_text("text", clip=area_part1).split("\n")
+    datos = {
+        "Razon Social": text_empresa[1],
+        "Establecimiento": text_empresa[3],
+        "Domicilio": text_empresa[4],
+        "Localidad-CP": text_empresa[5],
+        "Provincia": text_empresa[6]
+    }
+    return datos
+
+# 🧼 Función auxiliar para limpiar y conservar solo números, comas y puntos
+def limpiar_numeros(texto):
+    if isinstance(texto, str):
+        return ''.join(re.findall(r"[0-9.,]", texto))
+    else:
+        return ""
+
+# 📊 Buscar una celda en un DataFrame según un concepto, posición y desplazamiento
+    # "df" es el dataframe que recibe la funcion, esta funcion sirve para el area donde se encuentran los importes por detalle
+    # "concepto" es texto o la palabra que busca la funcion
+    # "col_busqueda" es la columna sobre la cual va a buscar el texto
+    # "posLista" le indicas que posicion de la lista de textos necesitas
+    # "agregar_abajo" le indicas cuantas posiciones de mueve hacia abajo
+    # "col_resultado" es la columna sobre la cual va a extraer el resultado de tu busqueda
+def fx_buscar_celda(df, concepto, col_busqueda, posLista, agregar_abajo, col_resultado):
+    idx = df[df.iloc[:, col_busqueda].str.contains(concepto, case=False, na=False)].index
+    if not idx.empty and (idx[0] + 1 < len(df)):
+        encontrado = df.iloc[idx[posLista] + agregar_abajo, col_resultado]
+    else:
+        encontrado = ""
+    return encontrado
+
+# 🧾 Extraer importes contables/impositivos desde múltiples páginas del PDF
+patron_i = r"Base Imponible|Deduc. Impositivas|FECHA DE PAGO"
+patron_f = r"SR.|Continúa|SE ACREDITO EN"
+
+def fx_Extraer_importes(doc):
+    dfs = []
+    for i in range(len(doc)):
+        textos = doc[i].get_text("text")
+        if "FECHA DE PAGO" in textos or "SE ACREDITO EN" in textos:
+            txt_resumen = doc[i].get_text("words")
+            # Construir matriz tipo OCR
+            Lista_resumen = [(
+                round(tupla[3] * 1.7 / 10),
+                1 if tupla[2] < 190 else
+                2 if tupla[2] < 280 else
+                3 if tupla[2] < 420 else
+                4 if tupla[2] < 500 else 5,
+                tupla[4]
+            ) for tupla in txt_resumen]
+            df = pd.DataFrame(Lista_resumen, columns=['Fila', 'Col', 'Valor'])
+            df = df.pivot_table(index='Fila', columns='Col', values='Valor', aggfunc=lambda x: ' '.join(str(v) for v in x)).reset_index()
+
+            # Detectar secciones relevantes por patrones
+            id_inicio = next(iter(df[df.iloc[:, 1].str.contains(patron_i, case=False, na=False)].index), 0)
+            id_final = df[df.iloc[:, 1].str.contains(patron_f, case=False, na=False)].index.tolist()[0]
+            df = df[id_inicio:id_final + 2]
+            df.drop("Fila", axis=1, inplace=True)
+            dfs.append(df)
+
+    df_liq = pd.concat(dfs).reset_index()
+
+    # Diccionario con todos los conceptos contables/impositivos
+    importes_liq = {
+        "png_21": fx_buscar_celda(df_liq, "Tasa 21", 1, 0, 0, 2),
+        "png_105": fx_buscar_celda(df_liq, "Tasa 10", 1, 0, 0, 2),
+        "iva_21": fx_buscar_celda(df_liq, "IVA 21", 3, 0, 0, 4),
+        "iva_105": fx_buscar_celda(df_liq, "IVA 10", 3, 0, 0, 4),
+        "ret_ib_sirtac": fx_buscar_celda(df_liq, "SIRTAC", 3, 0, 0, 4),
+        "sellos_3": fx_buscar_celda(df_liq, "Sellos PEX", 3, 0, 0, 4),
+        "percepcion_iva_3": fx_buscar_celda(df_liq, "RG 2408 3", 3, 0, 0, 4),
+        "percepcion_iva_1,5": fx_buscar_celda(df_liq, "Percpecion 1.5%", 3, 0, 0, 4),
+        "multa": fx_buscar_celda(df_liq, "Multa", 3, 0, 0, 4),
+        "Bonif Cargo Serv": fx_buscar_celda(df_liq, "Bonif", 3, 0, 0, 4),
+        "Cargo por Servicio": fx_buscar_celda(df_liq, "Cargo por Servicio", 3, 0, 0, 4),
+        "Se Acredito": fx_buscar_celda(df_liq, "SE ACREDITO", 1, 0, 1, 1)
+    }
+    return importes_liq
+
+# 🧾 Extraer información de resumen de liquidación desde área definida
+def fx_datos_liq(doc):
+    text_resumen = doc[0].get_text("words", clip=area_part2)
+    List_resumen = [(
+        round(tupla[3] * 3 / 10),
+        1 if tupla[2] < 455 else 2,
+        tupla[4]
+    ) for tupla in text_resumen]
+    df = pd.DataFrame(List_resumen, columns=['Fila', 'Col', 'Valor'])
+    df = df.pivot_table(index='Fila', columns='Col', values='Valor', aggfunc=lambda x: ' '.join(str(v) for v in x))
+    df[1] = df[1].ffill()  # Rellenar valores faltantes en columna 1
+    df = df[df[2].notna() & (df[2] != '')].reset_index()
+
+# 🧾 Extraer información de resumen de liquidación desde área definida
+def fx_datos_liq(doc):
+    text_resumen = doc[0].get_text("words", clip=area_part2)
+    List_resumen = [(
+        round(tupla[3] * 3 / 10),
+        1 if tupla[2] < 455 else 2,
+        tupla[4]
+    ) for tupla in text_resumen]
+    df = pd.DataFrame(List_resumen, columns=['Fila', 'Col', 'Valor'])
+    df = df.pivot_table(index='Fila', columns='Col', values='Valor', aggfunc=lambda x: ' '.join(str(v) for v in x))
+    df[1] = df[1].ffill()  # Rellenar valores faltantes en columna 1
+    df = df[df[2].notna() & (df[2] != '')].reset_index()  # Filtrar filas válidas
+
+    # Diccionario con todos los campos clave extraídos del resumen
+    resumen = {
+        "Fecha Emision": fx_buscar_celda(df, "FECHA", 1, 0, 0, 2),
+        "Nro Resumen": fx_buscar_celda(df, "RESUMEN", 1, 1, 0, 2),
+        "Pagador": fx_buscar_celda(df, "PAGADOR", 1, 0, 0, 2),
+        "Sucursal": fx_buscar_celda(df, "SUCURSAL", 1, 0, 0, 2),
+        "Domicilio Suc": fx_buscar_celda(df, "DOMICILIO", 1, 0, 0, 2),
+        "Cuit": fx_buscar_celda(df, "DE CUIT", 1, 0, 0, 2),
+        "Resp/Caracter": fx_buscar_celda(df, "/CARACTER", 1, 0, 0, 2),
+        "Nro Agente Ret": fx_buscar_celda(df, "BRUTOS", 1, 0, 0, 2),
+        "Cuit Establ": fx_buscar_celda(df, "CUIT ESTABLEC", 1, 0, 0, 2),
+        "Caracter": fx_buscar_celda(df, "CARACTER", 1, 1, 0, 2),
+        "Nro IIBB": fx_buscar_celda(df, "BRUTOS", 1, 1, 0, 2),
+        "Nro Establ": fx_buscar_celda(df, "DE ESTABLEC", 1, 0, 0, 2),
+        "Total Present Pesos": fx_buscar_celda(df, "PRESENTADO", 1, 0, 1, 1),
+        "Total Desc Pesos": fx_buscar_celda(df, "DESCUENTO", 1, 0, 1, 1),
+        "Saldo Pesos": fx_buscar_celda(df, "SALDO", 1, 0, 1, 1),
+        "Total Present Dolar": fx_buscar_celda(df, "PRESENTADO", 1, 0, 1, 2),
+        "Total Desc Dolar": fx_buscar_celda(df, "DESCUENTO", 1, 0, 1, 2),
+        "Saldo Dolar": fx_buscar_celda(df, "SALDO", 1, 0, 1, 2)
+    }
+    return resumen
+
+# 🔁 Bucle principal para procesar todos los archivos PDF de una carpeta
+
+carpeta = r"D:XXXXXXXXXXX"                          # Ruta de la carpeta de archivos pdf
+data = []
+for i in os.listdir(carpeta):                       # Iterar por todos los archivos en la carpeta
+    ruta = os.path.join(carpeta, i)                 # Obtener ruta completa
+    doc = pymupdf.open(ruta)                        # Abrir el documento PDF
+
+    txt__img = fx_Text_Img(doc)                     # Extraer textos desde imágenes embebidas
+    tarj_banc = {j: valor for j, valor in enumerate(txt__img)}  # Enumerar resultados por índice
+
+    datos_emp = fx_datos_empresa(doc)               # Extraer datos de empresa
+    datos_liq = fx_datos_liq(doc)                   # Extraer resumen de liquidación
+    datos_importes = fx_Extraer_importes(doc)       # Extraer importes impositivos y contables
+
+    # 🧩 Combinar toda la información en un único diccionario por archivo
+    data.append(tarj_banc | datos_emp | datos_liq | datos_importes | {"archivo": i})
